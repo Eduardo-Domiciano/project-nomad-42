@@ -1,0 +1,95 @@
+# Deploy deste repositório para uma VPS via SSH.
+# Na VPS o código já precisa estar clonado uma vez (ver install/setup_vps.sh).
+#
+# Secrets necessários (Settings → Secrets and variables → Actions):
+#   VPS_HOST      — IP ou hostname da VPS
+#   VPS_USER      — usuário SSH (ex.: ubuntu, root, deploy)
+#   VPS_SSH_KEY   — chave privada SSH (conteúdo completo, incl. -----BEGIN...)
+#   VPS_APP_DIR   — caminho do clone na VPS (ex.: /opt/nomad-src)
+# Opcionais:
+#   VPS_PORT      — porta SSH (padrão 22)
+#   VPS_BRANCH    — branch a publicar (padrão: a branch que disparou o workflow)
+name: Deploy to VPS
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'CODE_OF_CONDUCT.md'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'FAQ.md'
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy via SSH
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy on VPS
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          script_stop: true
+          command_timeout: 60m
+          script: |
+            set -euo pipefail
+            APP_DIR="${{ secrets.VPS_APP_DIR }}"
+            BRANCH="${{ secrets.VPS_BRANCH }}"
+            if [ -z "$APP_DIR" ]; then
+              echo "Secret VPS_APP_DIR não configurado."
+              exit 1
+            fi
+            if [ -z "$BRANCH" ]; then
+              BRANCH="${{ github.ref_name }}"
+            fi
+
+            cd "$APP_DIR"
+
+            echo "==> Atualizando código ($BRANCH)..."
+            git fetch --all --prune
+            git checkout "$BRANCH"
+            git pull --ff-only origin "$BRANCH"
+
+            if [ ! -f .env ]; then
+              echo "Falta .env em $APP_DIR. Rode antes: bash install/setup_vps.sh"
+              exit 1
+            fi
+
+            export VERSION="${{ github.sha }}"
+            export VCS_REF="${{ github.sha }}"
+            export BUILD_DATE="${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}"
+
+            echo "==> Rebuild e restart dos containers..."
+            bash install/up_from_source.sh
+
+            echo "==> Aguardando health do admin..."
+            HOST_PORT="$(grep -E '^HOST_PORT=' .env | cut -d= -f2- || true)"
+            HOST_PORT="${HOST_PORT:-8080}"
+            ok=0
+            for i in $(seq 1 36); do
+              if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/health" >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+              sleep 5
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "Healthcheck falhou após ~3 min. Últimos logs do admin:"
+              docker compose -p project-nomad -f install/compose.from-source.yaml --env-file .env logs --tail=80 admin || true
+              exit 1
+            fi
+
+            echo "==> Deploy concluído (health OK)."
