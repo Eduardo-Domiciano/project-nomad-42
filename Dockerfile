@@ -1,27 +1,70 @@
 FROM node:22-slim AS base
 
 # Install bash & curl for entrypoint script compatibility, graphicsmagick for pdf2pic, and vips-dev & build-base for sharp 
+# ca-certificates/python3: required for @openzim/libzim download + node-gyp
 RUN apt-get update && apt-get install -y \
       bash \
       curl \
       openssl \
+      ca-certificates \
+      python3 \
       graphicsmagick \
       libvips-dev \
       build-essential \
       pciutils \
       && rm -rf /var/lib/apt/lists/*
 
+# Must match @openzim/libzim@4.0.0's bundled .env (download.openzim.org)
+ENV LIBZIM_VERSION=9.4.0
+
+# Prefetch libzim headers/libs so npm install doesn't depend on the flaky
+# async download-libzim.js (it swallows CDN errors and then node-gyp fails
+# with: fatal error: zim/archive.h: No such file or directory).
+RUN set -eux; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) zim_arch=x86_64 ;; \
+      aarch64) zim_arch=aarch64-manylinux ;; \
+      *) echo "Unsupported arch for libzim prefetch: $arch" >&2; exit 1 ;; \
+    esac; \
+    mkdir -p /opt/libzim-prefetch; \
+    url="https://download.openzim.org/release/libzim/libzim_linux-${zim_arch}-${LIBZIM_VERSION}.tar.gz"; \
+    echo "Prefetching libzim from $url"; \
+    curl -fsSL -o "/opt/libzim-prefetch/libzim.tar.gz" "$url"; \
+    tar -tzf /opt/libzim-prefetch/libzim.tar.gz >/dev/null; \
+    printf '%s\n' "$zim_arch" > /opt/libzim-prefetch/arch
+
 # All deps stage
 FROM base AS deps
 WORKDIR /app
 ADD admin/package.json admin/package-lock.json ./
-RUN npm ci
+RUN set -eux; \
+    zim_arch="$(cat /opt/libzim-prefetch/arch)"; \
+    npm ci --ignore-scripts; \
+    mkdir -p node_modules/@openzim/libzim/download; \
+    cp /opt/libzim-prefetch/libzim.tar.gz \
+      "node_modules/@openzim/libzim/download/libzim_linux-${zim_arch}-${LIBZIM_VERSION}.tar.gz"; \
+    tar --strip-components=1 -xf \
+      "node_modules/@openzim/libzim/download/libzim_linux-${zim_arch}-${LIBZIM_VERSION}.tar.gz" \
+      -C node_modules/@openzim/libzim/download; \
+    test -f node_modules/@openzim/libzim/download/include/zim/archive.h; \
+    npm rebuild
 
 # Production only deps stage
 FROM base AS production-deps
 WORKDIR /app
 ADD admin/package.json admin/package-lock.json ./
-RUN npm ci --omit=dev
+RUN set -eux; \
+    zim_arch="$(cat /opt/libzim-prefetch/arch)"; \
+    npm ci --omit=dev --ignore-scripts; \
+    mkdir -p node_modules/@openzim/libzim/download; \
+    cp /opt/libzim-prefetch/libzim.tar.gz \
+      "node_modules/@openzim/libzim/download/libzim_linux-${zim_arch}-${LIBZIM_VERSION}.tar.gz"; \
+    tar --strip-components=1 -xf \
+      "node_modules/@openzim/libzim/download/libzim_linux-${zim_arch}-${LIBZIM_VERSION}.tar.gz" \
+      -C node_modules/@openzim/libzim/download; \
+    test -f node_modules/@openzim/libzim/download/include/zim/archive.h; \
+    npm rebuild
 
 # Build stage
 FROM base AS build
